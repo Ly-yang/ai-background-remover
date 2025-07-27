@@ -1,0 +1,655 @@
+# docker-compose.yml - 开发环境配置
+version: '3.8'
+
+services:
+  # 前端服务
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - CHOKIDAR_USEPOLLING=true
+    depends_on:
+      - backend
+    networks:
+      - ai-remover-network
+
+  # 后端API服务
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./uploads:/app/uploads
+      - ./models:/app/models
+    environment:
+      - ENV=development
+      - DATABASE_URL=postgresql://postgres:password@db:5432/airemover
+      - REDIS_URL=redis://redis:6379
+      - SECRET_KEY=your-secret-key-here
+      - AI_MODELS_URL=http://ai-models:8001
+    depends_on:
+      - db
+      - redis
+      - ai-models
+    networks:
+      - ai-remover-network
+
+  # AI模型服务
+  ai-models:
+    build: 
+      context: ./ai-models
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./models:/app/models
+      - ./ai-models:/app
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTHONPATH=/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    runtime: nvidia
+    networks:
+      - ai-remover-network
+
+  # PostgreSQL数据库
+  db:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=airemover
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - ai-remover-network
+
+  # Redis缓存
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - ai-remover-network
+
+  # Nginx反向代理
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./uploads:/var/www/uploads
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - ai-remover-network
+
+  # 监控服务
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    networks:
+      - ai-remover-network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - ai-remover-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  ai-remover-network:
+    driver: bridge
+
+---
+
+# frontend/Dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+# 复制package文件
+COPY package*.json ./
+
+# 安装依赖
+RUN npm ci --only=production
+
+# 复制源代码
+COPY . .
+
+# 暴露端口
+EXPOSE 3000
+
+# 启动命令
+CMD ["npm", "start"]
+
+---
+
+# backend/Dockerfile
+FROM python:3.9-slim
+
+# 设置工作目录
+WORKDIR /app
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制requirements文件
+COPY requirements.txt .
+
+# 安装Python依赖
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建必要的目录
+RUN mkdir -p uploads/original uploads/processed uploads/temp models
+
+# 暴露端口
+EXPOSE 8000
+
+# 启动命令
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+---
+
+# ai-models/Dockerfile
+FROM nvidia/cuda:11.8-runtime-ubuntu20.04
+
+# 设置环境变量
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libgl1-mesa-glx \
+    wget \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制requirements文件
+COPY requirements.txt .
+
+# 安装Python依赖
+RUN pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建模型目录
+RUN mkdir -p models/rmbg models/u2net models/birefnet models/sam models/isnet
+
+# 暴露端口
+EXPOSE 8001
+
+# 启动命令
+CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+
+---
+
+# infrastructure/docker/docker-compose.prod.yml - 生产环境配置
+version: '3.8'
+
+services:
+  frontend:
+    image: ai-remover/frontend:latest
+    build: 
+      context: ../../frontend
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+    networks:
+      - ai-remover-network
+
+  backend:
+    image: ai-remover/backend:latest
+    build: 
+      context: ../../backend
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+    environment:
+      - ENV=production
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - SECRET_KEY=${SECRET_KEY}
+      - AI_MODELS_URL=http://ai-models:8001
+    volumes:
+      - uploads_data:/app/uploads
+      - models_data:/app/models
+    depends_on:
+      - db
+      - redis
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
+    networks:
+      - ai-remover-network
+
+  ai-models:
+    image: ai-remover/ai-models:latest
+    build: 
+      context: ../../ai-models
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+    volumes:
+      - models_data:/app/models
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    runtime: nvidia
+    networks:
+      - ai-remover-network
+
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ai-remover-network
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    networks:
+      - ai-remover-network
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+      - uploads_data:/var/www/uploads
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - ai-remover-network
+
+  # 日志收集
+  fluentd:
+    image: fluent/fluentd:v1.16
+    restart: unless-stopped
+    volumes:
+      - ./fluentd/fluent.conf:/fluentd/etc/fluent.conf
+      - /var/log:/var/log
+    networks:
+      - ai-remover-network
+
+  # 监控
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus/prometheus.prod.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - ai-remover-network
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_SECURITY_SECRET_KEY=${GRAFANA_SECRET_KEY}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - ai-remover-network
+
+  # 自动扩缩容
+  portainer:
+    image: portainer/portainer-ce:latest
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - ai-remover-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  models_data:
+  prometheus_data:
+  grafana_data:
+  portainer_data:
+
+networks:
+  ai-remover-network:
+    driver: bridge
+
+---
+
+# nginx/nginx.conf - 开发环境Nginx配置
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # 日志格式
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    # Gzip压缩
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+    # 上游服务器
+    upstream frontend {
+        server frontend:3000;
+    }
+
+    upstream backend {
+        server backend:8000;
+    }
+
+    # 主服务器配置
+    server {
+        listen 80;
+        server_name localhost;
+
+        # 客户端最大请求体大小
+        client_max_body_size 10M;
+
+        # 前端路由
+        location / {
+            proxy_pass http://frontend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # WebSocket支持
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+
+        # API路由
+        location /api/ {
+            proxy_pass http://backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 超时设置
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 300s;
+        }
+
+        # 静态文件服务
+        location /uploads/ {
+            alias /var/www/uploads/;
+            expires 7d;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # 健康检查
+        location /health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+
+---
+
+# nginx/nginx.prod.conf - 生产环境Nginx配置
+events {
+    worker_connections 2048;
+    use epoll;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # 性能优化
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+
+    # 安全头
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Gzip压缩
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_comp_level 6;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/json
+        application/javascript
+        application/xml+rss
+        application/atom+xml
+        image/svg+xml;
+
+    # 速率限制
+    limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+    limit_req_zone $binary_remote_addr zone=upload:10m rate=1r/s;
+
+    # 上游服务器
+    upstream frontend {
+        least_conn;
+        server frontend:3000 max_fails=3 fail_timeout=30s;
+    }
+
+    upstream backend {
+        least_conn;
+        server backend:8000 max_fails=3 fail_timeout=30s;
+    }
+
+    # HTTPS重定向
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://$host$request_uri;
+    }
+
+    # 主服务器配置
+    server {
+        listen 443 ssl http2;
+        server_name your-domain.com;
+
+        # SSL配置
+        ssl_certificate /etc/nginx/ssl/cert.pem;
+        ssl_certificate_key /etc/nginx/ssl/key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384;
+        ssl_prefer_server_ciphers off;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+
+        # 客户端最大请求体大小
+        client_max_body_size 20M;
+
+        # 前端路由
+        location / {
+            proxy_pass http://frontend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 缓存静态资源
+            location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+            }
+        }
+
+        # API路由
+        location /api/ {
+            limit_req zone=api burst=20 nodelay;
+            
+            proxy_pass http://backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 超时设置
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 600s;
+        }
+
+        # 上传接口特殊限制
+        location /api/v1/process {
+            limit_req zone=upload burst=5 nodelay;
+            
+            proxy_pass http://backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 600s;
+        }
+
+        # 静态文件服务
+        location /uploads/ {
+            alias /var/www/uploads/;
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+            
+            # 防盗链
+            valid_referers none blocked server_names;
+            if ($invalid_referer) {
+                return 403;
+            }
+        }
+
+        # 健康检查
+        location /health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+
+        # 禁止访问隐藏文件
+        location ~ /\. {
+            deny all;
+        }
+    }
+}
