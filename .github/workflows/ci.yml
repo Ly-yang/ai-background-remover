@@ -95,7 +95,7 @@ jobs:
     - name: Install dependencies
       run: |
         cd frontend
-        npm ci || npm install
+        npm install
     
     - name: Lint frontend code
       run: |
