@@ -1,7 +1,9 @@
-{"name": "ai-background-remover-frontend",
+{
+  "name": "ai-background-remover-frontend",
   "version": "1.0.0",
   "scripts": {
     "test": "echo \"No tests specified\" && exit 0",
     "lint": "echo \"No linting configured\" && exit 0",
     "format:check": "echo \"No formatting check configured\" && exit 0"
   }
+}
